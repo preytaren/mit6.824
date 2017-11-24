@@ -5,7 +5,6 @@ import (
     "io/ioutil"
     "os"
     "log"
-    "fmt"
     "encoding/json"
 )
 
@@ -71,7 +70,7 @@ func doMap(
 		//fmt.Println(float64(ihash(item.Key)), float64(nReduce))
 		data[r] = append(data[r], item)
 	}
-	fmt.Println(mapTaskNumber)
+	//fmt.Println(mapTaskNumber)
 	for key, value := range data{
 		fileName := reduceName(jobName, mapTaskNumber, key)
 		f, _ := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE, 0666)
