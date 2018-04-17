@@ -11,6 +11,12 @@ package raft
 
 import "sync"
 
+
+type PeerState struct {
+    Term int
+    VoteId int
+}
+
 type Persister struct {
 	mu        sync.Mutex
 	raftstate []byte
