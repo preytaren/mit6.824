@@ -68,12 +68,14 @@ type AppendEntriesArgs struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendResult)  {
 	defer DPrintf("%d send AppendEntries to %d, %d", args.LeaderId, rf.me, rf.state)
 	rf.mu.Lock()
+	//rf.state = FOLLOWER
 	defer rf.mu.Unlock()
-	if rf.state == CANDIDATE {
-		if args.Term >= rf.currentTerm {
-			rf.state = FOLLOWER
-		}
+
+
+	if args.Term >= rf.currentTerm {
+		rf.state = FOLLOWER
 	}
+
 	if rf.state == FOLLOWER {
 		rf.resetHeartBeatsTimer()
 		if args.Term < rf.currentTerm || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -92,8 +94,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendResult)  {
 				rf.commitIndex = args.LeaderCommit
 			}
 		}
-		reply.Term = rf.currentTerm
+	} else {
+		reply.Success = false
 	}
+	reply.Term = rf.currentTerm
 }
 
 func (rf *Raft) resetHeartBeatsTimer() bool {
@@ -130,11 +134,14 @@ type Raft struct {
 	lastApplied int
 	state RaftState
 	applyCh chan ApplyMsg
+	stateCh chan RaftState
 
 	nextIndex  []int
 	matchIndex []int
 
 	heartBeatsTimer *time.Timer
+	replyTimer *time.Timer
+	replyTimeout bool
 }
 
 func (rf *Raft) NewTimer() {
@@ -222,26 +229,21 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	defer DPrintf("%d(%d|term%d|vote%d) replyed %d(%d) with %s", rf.me, rf.state, rf.currentTerm, rf.votedFor, args.CandidateId, args.Term, reply)
-	rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
-		DPrintf("1")
 		reply.VoteGranted = false
 		return
 	} else if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && args.LastLogIndex >= rf.lastApplied {
-		DPrintf("2")
 		//rf.resetHeartBeatsTimer()
 
 		reply.VoteGranted = true
-		rf.mu.Lock()
 		// rf.currentTerm += 1
-		rf.currentTerm = reply.Term
+		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
 		rf.state = FOLLOWER
-		rf.mu.Unlock()
 		return
 	} else {
-		DPrintf("3")
 		reply.VoteGranted = false
 	}
 	reply.Term = rf.currentTerm
@@ -330,16 +332,51 @@ func getSleepTime() time.Duration {
 	return time.Duration(150 + rand.Int31n(250)) * time.Millisecond
 }
 
+type ReplyTimer struct {
+	mu sync.Mutex
+	timer *time.Timer
+	Timeout bool
+}
+
+func (tm *ReplyTimer) StartReplyTimer(duration time.Duration) {
+	DPrintf("TIMER %s", duration * time.Millisecond / 10)
+	tm.timer = time.NewTimer(duration * time.Millisecond / 10)
+}
+
+func (tm *ReplyTimer) Wait() bool {
+	DPrintf("WAIT")
+	tm.mu.Lock()
+	tm.Timeout = true
+	tm.mu.Unlock()
+	<- tm.timer.C
+	return tm.Timeout
+}
+
+func (tm *ReplyTimer) ResetReplyTimer(duration time.Duration) {
+	DPrintf("RESET TIMER")
+	tm.mu.Lock()
+	tm.Timeout = false
+	tm.mu.Unlock()
+	tm.timer.Reset(duration * time.Millisecond)
+}
+
+func (tm *ReplyTimer) StopReplyTimer() bool {
+	defer DPrintf("STOP TIMER")
+	tm.mu.Lock()
+	tm.Timeout = false
+	tm.mu.Unlock()
+	return tm.timer.Stop()
+}
+
 func (rf *Raft) StartVote() bool {
-	DPrintf("STARTVOTE %d", rf.me)
-	replyChan := make(chan RequestVoteReply, len(rf.peers))
+	DPrintf("%d STARTVOTE", rf.me)
+	replyChan := make(chan *RequestVoteReply, len(rf.peers))
 	rf.mu.Lock()
 	rf.currentTerm += 1
-	rf.votedFor = rf.me
 	rf.mu.Unlock()
 	// DPrintf("#%s StartVote", rf.me)
 	for idx, _ := range rf.peers {
-		go func(repl chan RequestVoteReply, peerId int) {
+		go func(repl chan *RequestVoteReply, peerId int) {
 			var lastTerm int
 			if rf.lastApplied >= 1 {
 				lastTerm = rf.logs[rf.lastApplied].Term
@@ -349,25 +386,46 @@ func (rf *Raft) StartVote() bool {
 			args := RequestVoteArgs{rf.currentTerm, rf.me, rf.lastApplied, lastTerm}
 			rep := RequestVoteReply{}
 			//DPrintf("%dSend to %d", rf.me, peerId)
-			rf.sendRequestVote(peerId, &args, &rep)
-			repl <- rep
-		}(replyChan, idx)
+			tm := ReplyTimer{}
+			tm.StartReplyTimer(time.Duration(300))
 
-		// count follower
+			go func (timer ReplyTimer) {
+				ok := tm.Wait()
+				if  ok {
+					repl <- nil
+					DPrintf("REPLY TIMEOUT %d", peerId)
+				}
+			}(tm)
+
+			rf.sendRequestVote(peerId, &args, &rep)
+			DPrintf("%d NORMAL RETURN %s", peerId, rep)
+			if tm.StopReplyTimer(){
+				DPrintf("%d NORMAL RETURN %s", peerId, rep)
+				repl <- &rep
+			}
+		}(replyChan, idx)
 	}
+
 	count := 0
+	nocount := 0
 	for each := range replyChan {
-		if each.VoteGranted {
+		if each == nil {
+			DPrintf("GOT NIL %s", each)
+			nocount += 1
+		} else if each.VoteGranted {
 			count += 1
-			// DPrintf("GRANTED")
+		} else {
+			nocount += 1
 		}
 		if count > len(rf.peers) / 2 {
 			DPrintf("%s was elected", rf.me)
-			//rf.StartHeartBeats()
 			return true
+		} else if nocount > len(rf.peers) / 2 {
+			DPrintf("%s election failed", rf.me)
+			return false
 		}
 	}
-	rf.state = FOLLOWER
+	DPrintf("%s election failed", rf.me)
 	return false
 }
 
@@ -411,13 +469,11 @@ func (rf *Raft) WaitForHBTimer() {
 }
 
 func (rf *Raft) CheckState() {
-	DPrintf("rf%d State %d", rf.me, rf.state)
 	for {
 		switch rf.state{
 		case CANDIDATE:
 			// rf.heartBeatsTimer.Stop()
 			rf.mu.Lock()
-			rf.votedFor = rf.me
 			rf.mu.Unlock()
 			ok := rf.StartVote()
 			rf.mu.Lock()
@@ -426,19 +482,17 @@ func (rf *Raft) CheckState() {
 				rf.state = LEADER
 			} else {
 				rf.votedFor = -1
+				rf.resetHeartBeatsTimer()
 				rf.state = FOLLOWER
 			}
 			rf.mu.Unlock()
-			break
 		case LEADER:
 			//DPrintf("CHECKSTATE node%d, with state%d", rf.me, rf.state)
 			DPrintf("LEADER%d", rf.me, rf.state)
 			rf.heartBeatsTimer.Stop()
 			rf.StartHeartBeats()
-			break
 		case FOLLOWER:
 			// rf.heartBeatsTimer.Reset(getSleepTime())
-			break
 		}
 	}
 }
