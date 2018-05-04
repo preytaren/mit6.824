@@ -52,7 +52,6 @@ type ApplyMsg struct {
 }
 
 type AppendResult struct {
-	mu      sync.Mutex
 	Term    int
 	Success bool
 }
@@ -124,7 +123,9 @@ func (tm *ReplyTimer) Wait() bool {
 	tm.Timeout = true
 	tm.mu.Unlock()
 	<-tm.timer.C
+	tm.mu.Lock()
 	timeout := tm.Timeout
+	tm.mu.Unlock()
 	return timeout
 }
 
@@ -232,10 +233,6 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendResult) {
 	rf.mu.Lock()
 
-	if args.Term > rf.currentTerm {
-		rf.state = FOLLOWER
-		rf.currentTerm = args.Term
-	}
 
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit >= len(rf.logs)-1 {
@@ -250,40 +247,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendResult) {
 	rf.resetHeartBeatsTimer()
 
 	if args.Entries == nil {
-		rf.mu.Lock()
-		reply.Term = rf.currentTerm
-		reply.Success = true
-		rf.mu.Unlock()
-		return
-	}
-	DPrintf("APPENDENTRIES %s to NODE %d", args.Entries, rf.me)
-
-	DPrintf("Node %d.term %d sendto(>=) %d.term %d(state %d) ", args.LeaderId, args.Term, rf.me, rf.currentTerm, rf.state)
-	DPrintf("%d == %d, args.PRevTerm %d",  rf.logs, args.PrevLogIndex, args.PrevLogTerm )
-	DPrintf("rf.Logs %s, rf.state %d", rf.logs, rf.state)
-	rf.mu.Lock()
-	if rf.state == FOLLOWER {
-		if args.Term < rf.currentTerm || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-			reply.Success = false
+		if rf.state != LEADER{
+			rf.mu.Lock()
 			reply.Term = rf.currentTerm
-			DPrintf("APPEND Entry %s to Node %d in Term %d, reply %s", args.Entries, rf.me, rf.currentTerm, reply)
-			return
-		} else {
-			// append log
-			rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
-			rf.currentTerm = args.Term
-			//rf.lastApplied += len(args.Entries)
 			reply.Success = true
-			reply.Term = rf.currentTerm
-			DPrintf("APPEND Entry %s to Node %d in Term %d, reply %s", args.Entries, rf.me, rf.currentTerm, reply)
-			// DPrintf("args.PrevlogIndex %d, args.PrevlogTerm %d == rf.prevTerm %d, result %s", args.PrevLogIndex, args.PrevLogTerm, rf.logs[args.PrevLogIndex].Term, reply.Success)
+			rf.state = FOLLOWER
+			rf.currentTerm = args.Term
+			rf.mu.Unlock()
+			return
 		}
+	}
 
-		// apply logs
-	} else {
+	rf.mu.Lock()
+	//DPrintf("Node: %d, PrevlogIndex: %d, logs: %s", rf.me, args.PrevLogIndex, rf.logs)
+	if args.Term < rf.currentTerm || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		//DPrintf("%d in Term %d APPEND Entry %s to Node %d in Term %d, reply %s", args.LeaderId, args.Term, args.Entries, rf.me, rf.currentTerm, reply)
+	} else {
+		rf.state = FOLLOWER
+		rf.currentTerm = args.Term
+		// append log
+		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+		//DPrintf("[APPEND] logs %s ON NODE %d", args.Entries, rf.me)
+		rf.currentTerm = args.Term
+		reply.Success = true
+		reply.Term = rf.currentTerm
 	}
+
 	rf.mu.Unlock()
 	// DPrintf("111args.PrevlogIndex %d, args.PrevlogTerm %d == rf.prevTerm %d, result %s", args.PrevLogIndex, args.PrevLogTerm, rf.logs[args.PrevLogIndex].Term, reply.Success)
 }
@@ -363,7 +354,7 @@ func (rf *Raft) StartVote() bool {
 	rf.mu.Lock()
 	rf.currentTerm += 1
 	rf.mu.Unlock()
-	DPrintf("Node %d StartVote", rf.me)
+	//DPrintf("[STARTVOTE] Node %d", rf.me)
 	for idx, _ := range rf.peers {
 		go func(repl chan *RequestVoteReply, peerId int) {
 			var lastTerm int
@@ -433,10 +424,13 @@ func (rf *Raft) StartVote() bool {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	if rf.state != LEADER {
+	rf.mu.Lock()
+	state := rf.state
+	rf.mu.Unlock()
+	if state != LEADER {
 		return -1, -1, false
 	}
-	DPrintf("START COMMAND %d ON NODE %d", command, rf.me)
+	DPrintf("[START COMMAND] %d ON NODE %d TERM %d", command, rf.me, rf.currentTerm)
 
 	index := -1
 	term, isLeader := rf.GetState()
@@ -444,11 +438,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 
 	log := Log{rf.currentTerm, command}
-	index = rf.lastApplied + 1
 
 
 	rf.mu.Lock()
+	index = len(rf.logs)
 	rf.logs = append(rf.logs, log)
+	rf.matchIndex[rf.me] += 1
+	rf.nextIndex[rf.me] += 1
 	rf.mu.Unlock()
 
 
@@ -466,7 +462,10 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) SendHeartBeats() {
-	for rf.state == LEADER {
+	rf.mu.Lock()
+	state := rf.state
+	rf.mu.Unlock()
+	for state == LEADER {
 		for peerId, _ := range rf.peers {
 			if peerId == rf.me {
 				continue
@@ -475,17 +474,28 @@ func (rf *Raft) SendHeartBeats() {
 				prevLogIndex := 0//+ rf.matchIndex[peerId]
 				var prevLogTerm int
 				//DPrintf("PREvLOG %d", prevLogIndex)
+				rf.mu.Lock()
 				prevLogTerm = rf.logs[prevLogIndex].Term
 				args := AppendEntriesArgs{rf.currentTerm, rf.me,
 					prevLogIndex, prevLogTerm, nil,
 					rf.commitIndex}
+			    rf.mu.Unlock()
 				repl := AppendResult{}
 				//DPrintf("ARGS term %d Entries %s prevTerm %d", args.Term, args.Entries, args.PrevLogTerm)
 				rf.sendAppendEntries(peerId, &args, &repl)
+				rf.mu.Lock()
+				if repl.Term > rf.currentTerm {
+					rf.currentTerm = repl.Term
+					rf.state = FOLLOWER
+				}
+				rf.mu.Unlock()
 			}(peerId)
 		}
 		sleepTime := time.Duration(30) * time.Millisecond
 		time.Sleep(sleepTime)
+		rf.mu.Lock()
+		state = rf.state
+		rf.mu.Unlock()
 	}
 }
 
@@ -496,19 +506,25 @@ func (rf *Raft) resetHeartBeatsTimer() bool {
 	slTime := getSleepTime()
 	res := rf.heartBeatsTimer.Reset(slTime)
 	return res
-	//DPrintf("Reset: %s to %s", rf.me, slTime)
 }
 
 // is leader, check logs
 func (rf *Raft) CheckLogs() {
-	for rf.state == LEADER {
+	rf.mu.Lock()
+	state := rf.state
+	rf.mu.Unlock()
+	for state == LEADER {
 		//DPrintf("CHECKLOGS ON NODE %d: logs %s", rf.me, rf.logs)
 		//appendChan := make(chan AppendResult, len(rf.peers))
 		for peerId := range rf.peers {
 			if peerId == rf.me {
 				continue
 			}
-			if len(rf.logs) > rf.nextIndex[peerId] {
+			rf.mu.Lock()
+			logLen := len(rf.logs)
+			nextIndex := rf.nextIndex[peerId]
+			rf.mu.Unlock()
+			if logLen > nextIndex {
 				go func(peerId int) {
 					rf.mu.Lock()
 					prevLogIndex := rf.matchIndex[peerId]
@@ -516,53 +532,68 @@ func (rf *Raft) CheckLogs() {
 					args := AppendEntriesArgs{rf.currentTerm, rf.me,
 						prevLogIndex, prevLogTerm,
 						rf.logs[prevLogIndex+1:], rf.commitIndex}
+						//DPrintf("[BEFOREAPPEND] ENTRIES %s PREV %d LOGS %s", args.Entries, args.PrevLogIndex, rf.logs)
 					repl := AppendResult{}
 					rf.mu.Unlock()
 					for rf.state == LEADER {
-						DPrintf("Send to Node %d", peerId)
-						DPrintf("rf.Logs %d > nextIndex %d rf.state", len(rf.logs), rf.nextIndex[peerId], rf.state)
 						rf.sendAppendEntries(peerId, &args, &repl)
-						DPrintf("me: %d PrevLogIndex %d, logs %s, repl %s", rf.me, args.PrevLogIndex, rf.logs, repl)
-						if repl.Success && rf.state == LEADER {
+						//DPrintf("[CHECKAPPENDENTRIES REPLY]me: %d Term %d send to %d args: %s repl %s", rf.me, rf.currentTerm, peerId, args, repl)
+						if repl.Success && rf.state == LEADER{
 							rf.mu.Lock()
-							rf.nextIndex[peerId] += len(args.Entries)
-							rf.matchIndex[peerId] += len(args.Entries)
+							rf.nextIndex[peerId] = args.PrevLogIndex + len(args.Entries) + 1
+							rf.matchIndex[peerId] = args.PrevLogIndex + len(args.Entries)
 							rf.mu.Unlock()
 							break
 						}
-						args.PrevLogIndex -= 1
+
 						rf.mu.Lock()
-						args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
-						args.Entries = rf.logs[args.PrevLogIndex+1:]
+						if repl.Term > rf.currentTerm {
+							rf.currentTerm = repl.Term
+							rf.state = FOLLOWER
+							break
+						}
+
+						if args.PrevLogIndex > 0 {
+							args.PrevLogIndex -= 1
+							args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+							args.Entries = rf.logs[args.PrevLogIndex+1:]
+						}
 						rf.mu.Unlock()
 					}
 				}(peerId)
 			}
 		}
-		time.Sleep(time.Duration(30) * time.Millisecond)
+		time.Sleep(time.Duration(50) * time.Millisecond)
 		// sleep for a while
 	}
 }
 
 func (rf *Raft) checkLeaderCommit() {
-	for rf.state == LEADER {
+	rf.mu.Lock()
+	state := rf.state
+	rf.mu.Unlock()
+	for state == LEADER {
 		rf.mu.Lock()
-		counter := make([]int, len(rf.logs))
+		counter := make([]int, len(rf.logs) + 1)
 		for peerId := range rf.peers{
-			DPrintf("rf.matchIndex[peerId] %d logs %s", rf.matchIndex[peerId], rf.logs)
 			counter[rf.matchIndex[peerId]] += 1
 		}
+		//DPrintf("[COUNTER] NODE %d %s", rf.me, counter)
+		rf.mu.Unlock()
 
 		count := 0
-		for i := len(rf.logs) - 1 ; i >= rf.commitIndex; i-- {
-			//DPrintf("i : %d counter: %s", i, counter)
+		rf.mu.Lock()
+		logLen := len(rf.logs)
+		commitIndex := rf.commitIndex
+		peerLen := len(rf.peers)
+		for i := logLen - 1 ; i >= commitIndex; i-- {
 			count += counter[i]
-			if count > len(rf.peers) / 2 && rf.logs[i].Term == rf.currentTerm {
+			if count > peerLen / 2 && rf.logs[i].Term == rf.currentTerm {
 				rf.commitIndex = i
-				// DPrintf("Node %d COMMITINDEX CHANGE TO %d", rf.me, i)
 				break
 			}
 		}
+		state = rf.state
 		rf.mu.Unlock()
 		time.Sleep(time.Duration(30) * time.Millisecond)
 	}
@@ -570,18 +601,20 @@ func (rf *Raft) checkLeaderCommit() {
 
 func (rf *Raft) CheckApply() {
 	for {
+		rf.mu.Lock()
 		//DPrintf("Node %d commitIndex %d > lastapplied %d", rf.me, rf.commitIndex, rf.lastApplied)
 		if rf.commitIndex > rf.lastApplied {
 			appMsg := ApplyMsg{}
-			appMsg.Index = rf.lastApplied + 1
-			appMsg.Command = rf.logs[rf.lastApplied + 1].Command
-			DPrintf("APPLYMSG: %s FROM: NODE %d", appMsg, rf.me)
-			rf.applyCh <- appMsg
-			rf.mu.Lock()
+			if rf.currentTerm == rf.logs[rf.lastApplied + 1].Term {
+			    appMsg.Index = rf.lastApplied + 1
+			    appMsg.Command = rf.logs[rf.lastApplied + 1].Command
+			    DPrintf("[APPLYMSG] INDEX: %d, CMD: %d FROM NODE %d TERM %d LEADER %d", appMsg.Index, appMsg.Command, rf.me, rf.currentTerm, rf.votedFor)
+			    rf.applyCh <- appMsg
+			}
 			rf.lastApplied += 1
-			rf.mu.Unlock()
 		}
-		time.Sleep(time.Duration(50) * time.Millisecond)
+		rf.mu.Unlock()
+		time.Sleep(time.Duration(35) * time.Millisecond)
 	}
 }
 
@@ -618,7 +651,6 @@ func (rf *Raft) CheckState() {
 			prev = state
 			continue
 		}
-		DPrintf("NOde %d, prev %d, state %d", rf.me, prev, state)
 		switch state {
 		case CANDIDATE:
 			//DPrintf("CheckState me%d:state%d:term%d", rf.me, rf.state, rf.currentTerm)
@@ -640,7 +672,7 @@ func (rf *Raft) CheckState() {
 				rf.mu.Unlock()
 			}
 		case LEADER:
-			DPrintf("Node %d Elected as Leader for Term %d", rf.me, rf.currentTerm)
+			DPrintf("[ELECTED]Node %d for Term %d", rf.me, rf.currentTerm)
 			rf.nextIndex = make([]int, len(rf.peers))
 			rf.matchIndex = make([]int, len(rf.peers))
 			for i := 0; i < len(rf.peers); i++ {
@@ -659,7 +691,7 @@ func (rf *Raft) CheckState() {
 
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	defer DPrintf("Make Node %d", me)
+	defer DPrintf("[Make Node] %d", me)
 	rf := &Raft{}
 	rf.mu.Lock()
 	rf.peers = peers

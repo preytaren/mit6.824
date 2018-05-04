@@ -117,6 +117,7 @@ func TestFailAgree2B(t *testing.T) {
 	// follower network disconnection
 	leader := cfg.checkOneLeader()
 	cfg.disconnect((leader + 1) % servers)
+	DPrintf("[DISCONNECTED] NODE %d", (leader + 1) % servers)
 
 	// agree despite one disconnected server?
 	cfg.one(102, servers-1)
@@ -127,6 +128,7 @@ func TestFailAgree2B(t *testing.T) {
 
 	// re-connect
 	cfg.connect((leader + 1) % servers)
+	DPrintf("[CONNECTED] NODE %d", (leader + 1) % servers)
 
 	// agree with full set of servers?
 	cfg.one(106, servers)
@@ -242,6 +244,7 @@ loop:
 		cmds := []int{}
 		for index := range is {
 			cmd := cfg.wait(index, servers, term)
+			DPrintf("[WAIT] INDEX: %d", index)
 			if ix, ok := cmd.(int); ok {
 				if ix == -1 {
 					// peers have moved on to later terms
@@ -300,6 +303,7 @@ func TestRejoin2B(t *testing.T) {
 
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
+	DPrintf("DISCONNECT")
 	cfg.disconnect(leader1)
 
 	// make old leader try to agree on some entries
@@ -315,11 +319,13 @@ func TestRejoin2B(t *testing.T) {
 	cfg.disconnect(leader2)
 
 	// old leader connected again
+	DPrintf("CONNECT")
 	cfg.connect(leader1)
 
 	cfg.one(104, 2)
 
 	// all together now
+	DPrintf("CONNECT")
 	cfg.connect(leader2)
 
 	cfg.one(105, servers)
